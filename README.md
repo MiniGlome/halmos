@@ -23,33 +23,7 @@ Join the [Halmos Telegram Group][chat] for any inquiries or further discussions.
 
 ## Installation
 
-### ⭐ Using `uv` (recommended for most users)
-
-```sh
-# install uv if you don't have it already
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# install the latest version of halmos for the current user and add it to PATH
-uv tool install --python 3.12 halmos
-
-# or, install the development version from the repository
-# uv tool install --python 3.12 git+https://github.com/a16z/halmos
-
-# after installing, you can update halmos to the latest version with:
-uv tool upgrade halmos
-```
-
-### Using `docker`
-
-You can download a pre-built Docker image that contains python, halmos, its dependencies, foundry, solvers, etc.:
-
-```sh
-docker pull ghcr.io/a16z/halmos:latest
-```
-
-### Using `pip` (for advanced users)
-
-Note: this is not recommended because of the extra work required to manage the python version and the virtual environment. But if you know what you are doing, and need the extra control, you can do it like this:
+### Using `pip`
 
 ```sh
 # make sure you have a suitable python version installed, e.g.:
@@ -58,11 +32,8 @@ python3.12 --version
 # create and activate a virtual environment with an explicit python version
 python3.12 -m venv .venv && source .venv/bin/activate
 
-# install the latest version of halmos
-pip install halmos
-
-# or, install the development version from the repository
-pip install git+https://github.com/a16z/halmos
+# install the development version from the repository
+pip install git+https://github.com/MiniGlome/halmos
 ```
 
 ## Usage
