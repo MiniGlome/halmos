@@ -4,6 +4,8 @@ import itertools
 import re
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -172,6 +174,7 @@ from halmos.exceptions import (
     PathEndingException,
     Revert,
     StackUnderflowError,
+    TestTimeout,
     WriteInStaticContext,
 )
 from halmos.logs import (
@@ -230,6 +233,19 @@ EMPTY_BYTES = ByteVec()
 EMPTY_KECCAK = 0xC5D2460186F7233C927E7DB2DCC703C0E500B653CA82273B7BFAD8045D85A470
 Z3_ZERO, Z3_ONE = con(0), con(1)
 MAX_CALL_DEPTH = 1024
+
+_test_deadline_context: ContextVar[float | None] = ContextVar(
+    "halmos_test_deadline", default=None
+)
+
+
+@contextmanager
+def with_test_deadline(deadline: float | None):
+    token = _test_deadline_context.set(deadline)
+    try:
+        yield
+    finally:
+        _test_deadline_context.reset(token)
 
 # Precompile addresses
 ECRECOVER_PRECOMPILE = BV(1, size=160)
@@ -1385,17 +1401,6 @@ class Exec:  # an execution path
         if match_dynamic_array_overflow_condition(cond):
             return unsat
 
-        # Check if the condition or its negation is already present in the path constraints.
-        # This quick existence check can make a significant difference when dealing with
-        # complex path constraints, where the solver might return unknown (under the 1ms timeout)
-        # even if the result is trivially sat or unsat.
-
-        if cond in self.path.conditions:
-            return sat
-
-        if simplify(Not(cond)) in self.path.conditions:
-            return unsat
-
     def check(self, cond: Any) -> Any:
         cond = simplify(cond)
 
@@ -1703,9 +1708,7 @@ class Exec:  # an execution path
             contract_name, filename, source_map = self._try_resolve_proxy_info(contract)
 
         if contract_name is None:
-            warn(
-                f"unknown deployed bytecode: {hexify(bytecode[:32].unwrap())}... ({byte_length(bytecode)} bytes total)"
-            )
+            warn(f"unknown deployed bytecode: {hexify(bytecode.unwrap())}")
 
         contract.contract_name = contract_name
         contract.filename = filename
@@ -3062,6 +3065,7 @@ class SEVM:
         coverage_output = self.options.coverage_output
         coverage = CoverageReporter()
         start_time = timer()
+        test_deadline = _test_deadline_context.get()
         fun_name = self.fun_info.name
 
         # TODO: break the backward dependency from traces, and use the existing trace lender methods
@@ -3082,6 +3086,9 @@ class SEVM:
 
         while (ex := next_ex or stack.pop()) is not None:
             try:
+                if test_deadline is not None and timer() >= test_deadline:
+                    raise TestTimeout("test execution timed out")
+
                 next_ex = None
                 step_id += 1
 

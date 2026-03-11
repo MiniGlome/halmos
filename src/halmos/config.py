@@ -320,6 +320,16 @@ class Config:
         metavar="MAX_DEPTH",
     )
 
+    test_timeout: str = arg(
+        help=(
+            "set wall-clock timeout for each test; 0 means no timeout. "
+            "Can specify a unit, e.g. '200ms', '5s', '2m', '1h', etc."
+        ),
+        global_default="1000s",
+        metavar="TIMEOUT",
+        action=ParseTimeout,
+    )
+
     array_lengths: str = arg(
         help="specify lengths for dynamic-sized arrays, bytes, and string types. Lengths can be specified as a comma-separated list of integers enclosed in curly braces, or as a single integer.",
         global_default=None,

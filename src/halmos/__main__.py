@@ -22,6 +22,7 @@ from datetime import timedelta
 from enum import Enum
 from functools import partial
 from importlib import metadata
+from timeit import default_timer as monotonic_timer
 from types import MappingProxyType
 
 from rich.console import Group
@@ -66,7 +67,7 @@ from halmos.constants import (
 )
 from halmos.contract import CoverageReporter
 from halmos.env import init_env
-from halmos.exceptions import FailCheatcode, HalmosException
+from halmos.exceptions import FailCheatcode, HalmosException, TestTimeout
 from halmos.flamegraphs import CallSequenceFlamegraph, call_flamegraph, exec_flamegraph
 from halmos.logs import (
     COUNTEREXAMPLE_INVALID,
@@ -101,6 +102,7 @@ from halmos.sevm import (
     id_str,
     jumpid_str,
     mnemonic,
+    with_test_deadline,
 )
 from halmos.solve import (
     ContractContext,
@@ -586,6 +588,8 @@ def run_target_contract(
             )
 
         except Exception as err:
+            if isinstance(err, TestTimeout):
+                raise
             error(f"run_target_contract {addr} {fun_sig}: {type(err).__name__}: {err}")
             if args.debug:
                 traceback.print_exc()
@@ -1039,6 +1043,10 @@ def run_test(ctx: FunctionContext) -> TestResult:
     timer.create_subtimer("paths")
 
     exs = run_message(ctx, sevm, message, dyn_params)
+    test_timeout_seconds = args.test_timeout
+    test_deadline = (
+        monotonic_timer() + test_timeout_seconds if test_timeout_seconds else None
+    )
 
     normal = 0
     potential = 0
@@ -1062,108 +1070,133 @@ def run_test(ctx: FunctionContext) -> TestResult:
     # (actually triggers path exploration)
     #
 
-    path_id = 0  # default value in case we don't enter the loop body
-    for path_id, ex in enumerate(exs):
-        # check if early exit is triggered
-        if ctx.solving_ctx.executor.is_shutdown():
-            if args.debug:
-                print("aborting path exploration, executor has been shutdown")
-            break
+    timed_out = False
+    models_timer_created = False
+    num_execs = 0
 
-        # cache exec in case we need to print it later
-        if args.print_failed_states:
-            ctx.exec_cache[path_id] = ex
-
-        if args.verbose >= VERBOSITY_TRACE_PATHS:
-            ui.print(f"Path #{path_id}:\n{indent_text(hexify(ex.path))}")
-            ui.print("\nTrace:")
-
-            with suspend_status(ui.status):
-                render_trace(ex.context)
-
-        if flamegraph_enabled and not is_invariant:
-            exec_flamegraph.add(ex.context)
-
-        output = ex.context.output
-        error_output = output.error
-        panic_found = ex.is_panic_of(args.panic_error_codes)
-
-        if panic_found or is_global_fail_set(ex.context):
-            potential += 1
-
-            try:
-                handler.handle_assertion_violation(
-                    path_id=path_id,
-                    ex=ex,
-                    panic_found=panic_found,
-                )
-            except ShutdownError:
-                if args.debug:
-                    print("aborting path exploration, executor has been shutdown")
-                break
-
-        elif ex.context.is_stuck():
-            debug(f"Potential error path (id: {path_id})")
-            path_ctx = PathContext(
-                args=args,
-                path_id=path_id,
-                query=ex.path.to_smt2(args),
-                solving_ctx=ctx.solving_ctx,
+    def ensure_within_timeout():
+        if test_deadline is not None and monotonic_timer() >= test_deadline:
+            raise TestTimeout(
+                f"{funsig}: timed out after {test_timeout_seconds:g}s"
             )
-            solver_output = solve_low_level(path_ctx)
-            if solver_output.result != unsat:
-                stuck.append((path_id, ex, ex.context.get_stuck_reason()))
-                if args.print_blocked_states:
-                    ctx.traces[path_id] = (
-                        f"{hexify(ex.path)}\n{rendered_trace(ex.context)}"
+
+    try:
+        with with_test_deadline(test_deadline):
+            for path_id, ex in enumerate(exs):
+                ensure_within_timeout()
+                num_execs = path_id + 1
+
+                # check if early exit is triggered
+                if ctx.solving_ctx.executor.is_shutdown():
+                    if args.debug:
+                        print("aborting path exploration, executor has been shutdown")
+                    break
+
+                # cache exec in case we need to print it later
+                if args.print_failed_states:
+                    ctx.exec_cache[path_id] = ex
+
+                if args.verbose >= VERBOSITY_TRACE_PATHS:
+                    ui.print(f"Path #{path_id}:\n{indent_text(hexify(ex.path))}")
+                    ui.print("\nTrace:")
+
+                    with suspend_status(ui.status):
+                        render_trace(ex.context)
+
+                if flamegraph_enabled and not is_invariant:
+                    exec_flamegraph.add(ex.context)
+
+                output = ex.context.output
+                error_output = output.error
+                panic_found = ex.is_panic_of(args.panic_error_codes)
+
+                if panic_found or is_global_fail_set(ex.context):
+                    potential += 1
+
+                    try:
+                        handler.handle_assertion_violation(
+                            path_id=path_id,
+                            ex=ex,
+                            panic_found=panic_found,
+                        )
+                    except ShutdownError:
+                        if args.debug:
+                            print("aborting path exploration, executor has been shutdown")
+                        break
+
+                elif ex.context.is_stuck():
+                    debug(f"Potential error path (id: {path_id})")
+                    path_ctx = PathContext(
+                        args=args,
+                        path_id=path_id,
+                        query=ex.path.to_smt2(args),
+                        solving_ctx=ctx.solving_ctx,
                     )
+                    solver_output = solve_low_level(path_ctx)
+                    if solver_output.result != unsat:
+                        stuck.append((path_id, ex, ex.context.get_stuck_reason()))
+                        if args.print_blocked_states:
+                            ctx.traces[path_id] = (
+                                f"{hexify(ex.path)}\n{rendered_trace(ex.context)}"
+                            )
 
-        elif not error_output:
-            if args.print_success_states:
-                print(f"# {path_id}")
-                print(ex)
-            normal += 1
+                elif not error_output:
+                    if args.print_success_states:
+                        print(f"# {path_id}")
+                        print(ex)
+                    normal += 1
 
-        # print post-states
-        if args.print_states:
-            print(f"# {path_id}")
-            print(ex)
-            print(rendered_call_sequence(ex.call_sequence))
+                # print post-states
+                if args.print_states:
+                    print(f"# {path_id}")
+                    print(ex)
+                    print(rendered_call_sequence(ex.call_sequence))
 
-        # 0 width is unlimited
-        if args.width and path_id >= args.width:
-            msg = "incomplete execution due to the specified limit"
-            warn(f"{funsig}: {msg}: --width {args.width}")
-            break
+                # 0 width is unlimited
+                if args.width and path_id >= args.width:
+                    msg = "incomplete execution due to the specified limit"
+                    warn(f"{funsig}: {msg}: --width {args.width}")
+                    break
 
-    num_execs = path_id + 1
+            # the name is a bit misleading: this timer only starts after the exploration phase is complete
+            # but it's possible that solvers have already been running for a while
+            timer.create_subtimer("models")
+            models_timer_created = True
 
-    # the name is a bit misleading: this timer only starts after the exploration phase is complete
-    # but it's possible that solvers have already been running for a while
-    timer.create_subtimer("models")
+            if potential > 0 and args.verbose >= 1:
+                print(
+                    f"# of potential paths involving assertion violations: {potential} / {num_execs}"
+                    f" (--solver-threads {args.solver_threads})"
+                )
 
-    if potential > 0 and args.verbose >= 1:
-        print(
-            f"# of potential paths involving assertion violations: {potential} / {num_execs}"
-            f" (--solver-threads {args.solver_threads})"
-        )
+            #
+            # display assertion solving progress
+            #
 
-    #
-    # display assertion solving progress
-    #
+            while True:
+                done = sum(fm.done() for fm in submitted_futures)
+                total = potential
+                if done == total:
+                    break
+                ensure_within_timeout()
+                if not args.no_status:
+                    elapsed = timedelta(seconds=int(timer.elapsed()))
+                    new_status = (
+                        f"{funsig}: [{elapsed}] solving queries: {done} / {total}"
+                    )
+                    ui.update_status(new_status)
+                time.sleep(0.1)
 
-    if not args.no_status:
-        while True:
-            done = sum(fm.done() for fm in submitted_futures)
-            total = potential
-            if done == total:
-                break
-            elapsed = timedelta(seconds=int(timer.elapsed()))
-            new_status = f"{funsig}: [{elapsed}] solving queries: {done} / {total}"
-            ui.update_status(new_status)
-            time.sleep(0.1)
+            ctx.thread_pool.shutdown(wait=True)
 
-    ctx.thread_pool.shutdown(wait=True)
+    except TestTimeout as err:
+        timed_out = True
+        if not models_timer_created:
+            timer.create_subtimer("models")
+            models_timer_created = True
+        warn(str(err))
+        ctx.solving_ctx.executor.shutdown(wait=False)
+        ctx.thread_pool.shutdown(wait=False, cancel_futures=True)
 
     timer.stop()
     time_info = timer.report(include_subtimers=args.statistics)
@@ -1173,7 +1206,10 @@ def run_test(ctx: FunctionContext) -> TestResult:
     #
 
     counter = Counter(str(m.result) for m in ctx.solver_outputs)
-    if counter["sat"] > 0:
+    if timed_out:
+        passfail = color_warn("[TIMEOUT]")
+        exitcode = Exitcode.TIMEOUT.value
+    elif counter["sat"] > 0:
         passfail = color_error("[FAIL]")
         exitcode = Exitcode.COUNTEREXAMPLE.value
     elif counter["err"] > 0:

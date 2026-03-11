@@ -50,6 +50,14 @@ class FailCheatcode(PathEndingException):
     pass
 
 
+class TestTimeout(PathEndingException):
+    """
+    Raised when a test execution exceeds the wall-clock timeout budget.
+    """
+
+    pass
+
+
 class EvmException(Exception):
     """
     Base class for all EVM exceptions.
